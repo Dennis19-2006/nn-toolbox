@@ -7,6 +7,7 @@ import json
 import os
 import threading
 import uuid
+import torch
 from typing import Dict, List, Optional, Literal
 
 import numpy as np

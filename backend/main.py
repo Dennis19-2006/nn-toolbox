@@ -31,6 +31,10 @@ app.include_router(predictor.router, prefix="/api")
 def root():
     return {"message": "Neural Network Toolbox API Running", "docs": "/docs"}
 
+# Serve Frontend Static Files
+if os.path.exists("./static"):
+    app.mount("/", StaticFiles(directory="./static", html=True), name="static")
+
 
 if __name__ == "__main__":
     import uvicorn

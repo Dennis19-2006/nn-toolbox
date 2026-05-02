@@ -19,7 +19,6 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# FIXED dependencies
 RUN apt-get update && apt-get install -y \
     libgl1 \
     libglib2.0-0 \
@@ -28,18 +27,16 @@ RUN apt-get update && apt-get install -y \
     libxrender1 \
     && rm -rf /var/lib/apt/lists/*
 
-# Python deps
-COPY requirements.txt .
+# ✅ FIXED PATH
+COPY backend/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy backend
-COPY . .
+# ✅ ONLY backend code
+COPY backend/ .
 
-# Copy frontend build
+# frontend build
 COPY --from=frontend-build /app/frontend/dist ./static
 
-# Railway provides PORT dynamically
 ENV PORT=8000
 
-# IMPORTANT: use shell form to allow $PORT
 CMD uvicorn main:app --host 0.0.0.0 --port $PORT

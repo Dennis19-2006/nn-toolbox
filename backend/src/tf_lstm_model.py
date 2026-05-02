@@ -4,15 +4,24 @@ Professional-level TensorFlow/Keras LSTM model for Sentiment Analysis.
 import threading
 import uuid
 from typing import Dict, List, Optional
-try:
-    import tensorflow as tf
-    HAVE_TF = True
-except ImportError:
-    tf = None
-    HAVE_TF = False
+import numpy as np
+
+_jobs: Dict[str, Dict] = {}
+_jobs_lock = threading.Lock()
+
+def get_job(job_id: str) -> Optional[Dict]:
+    with _jobs_lock:
+        return _jobs.get(job_id)
+
+def create_job() -> str:
+    job_id = str(uuid.uuid4())
+    with _jobs_lock:
+        _jobs[job_id] = {"status": "pending", "epochs": [], "gradients": {}}
+    return job_id
 
 # ─── Keras Callback ───────────────────────────────────────────────────────────
-if HAVE_TF:
+def get_epoch_callback_class():
+    import tensorflow as tf
     class EpochCallback(tf.keras.callbacks.Callback):
         def __init__(self, job_id: str):
             super().__init__()
@@ -20,7 +29,6 @@ if HAVE_TF:
     
         def on_epoch_end(self, epoch, logs=None):
             logs = logs or {}
-            # Map keras log keys to our standard API schema
             train_loss = logs.get("loss", 0.0)
             val_loss = logs.get("val_loss", 0.0)
             train_acc = logs.get("accuracy", 0.0)
@@ -35,9 +43,7 @@ if HAVE_TF:
             }
             with _jobs_lock:
                 _jobs[self.job_id]["epochs"].append(epoch_data)
-else:
-    class EpochCallback:
-        pass
+    return EpochCallback
 
 # ─── Training Function ────────────────────────────────────────────────────────
 def train_sentiment_tf(
@@ -55,9 +61,11 @@ def train_sentiment_tf(
     val_split: float = 0.2,
 ):
     """Runs in a background thread, writing metrics via EpochCallback."""
-    if not HAVE_TF:
+    try:
+        import tensorflow as tf
+    except ImportError:
         with _jobs_lock:
-            _jobs[job_id]["status"] = "error: TensorFlow is not installed in this environment (likely due to Python 3.14 incompatibility)."
+            _jobs[job_id]["status"] = "error: TensorFlow is not installed."
         return
 
     try:
@@ -98,6 +106,7 @@ def train_sentiment_tf(
         model.compile(optimizer=opt, loss=loss, metrics=["accuracy"])
         
         # Train with early stopping and custom callback
+        EpochCallback = get_epoch_callback_class()
         epoch_cb = EpochCallback(job_id)
         early_stop = tf.keras.callbacks.EarlyStopping(
             monitor='val_loss', 

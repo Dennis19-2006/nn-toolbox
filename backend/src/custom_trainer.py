@@ -7,9 +7,7 @@ import uuid
 from typing import Dict, List, Literal, Optional
 
 import numpy as np
-import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset
+import numpy as np
 
 from src.gradient_utils import register_gradient_hooks, compute_gradient_norms, diagnose_gradients
 
@@ -32,84 +30,92 @@ def create_job() -> str:
 
 # ─── Model Builder ───────────────────────────────────────────────────────────
 
-ACTIVATIONS = {
-    "relu": nn.ReLU,
-    "tanh": nn.Tanh,
-    "sigmoid": nn.Sigmoid,
-    "gelu": nn.GELU,
-    "leaky_relu": nn.LeakyReLU,
-}
+def get_torch_utils():
+    import torch
+    import torch.nn as nn
+    
+    ACTIVATIONS = {
+        "relu": nn.ReLU,
+        "tanh": nn.Tanh,
+        "sigmoid": nn.Sigmoid,
+        "gelu": nn.GELU,
+        "leaky_relu": nn.LeakyReLU,
+    }
 
-OPTIMIZERS = {
-    "adam": torch.optim.Adam,
-    "sgd": torch.optim.SGD,
-    "rmsprop": torch.optim.RMSprop,
-    "adamw": torch.optim.AdamW,
-}
+    OPTIMIZERS = {
+        "adam": torch.optim.Adam,
+        "sgd": torch.optim.SGD,
+        "rmsprop": torch.optim.RMSprop,
+        "adamw": torch.optim.AdamW,
+    }
+    
+    return torch, nn, ACTIVATIONS, OPTIMIZERS
 
-
-class DenseBlock(nn.Module):
-    def __init__(self, in_dim: int, out_dim: int, activation: str, dropout: float):
-        super().__init__()
-        act_cls = ACTIVATIONS.get(activation, nn.ReLU)
-        self.block = nn.Sequential(
-            nn.Linear(in_dim, out_dim),
-            nn.BatchNorm1d(out_dim),
-            act_cls(),
-            nn.Dropout(dropout),
-        )
-
-    def forward(self, x):
-        return self.block(x)
-
-
-class CustomModel(nn.Module):
-    def __init__(
-        self,
-        input_dim: int,
-        output_dim: int,
-        hidden_sizes: List[int],
-        arch: Literal["dense", "rnn", "lstm", "gru"],
-        activation: str = "relu",
-        dropout: float = 0.2,
-    ):
-        super().__init__()
-        self.arch = arch
-        self.hidden_sizes = hidden_sizes
-
-        if arch == "dense":
-            layers = []
-            prev = input_dim
-            for h in hidden_sizes:
-                layers.append(DenseBlock(prev, h, activation, dropout))
-                prev = h
-            self.network = nn.Sequential(*layers)
-            self.output = nn.Linear(prev, output_dim)
-        else:
-            rnn_cls = {"rnn": nn.RNN, "lstm": nn.LSTM, "gru": nn.GRU}[arch]
-            self.rnn = rnn_cls(
-                input_size=input_dim,
-                hidden_size=hidden_sizes[-1],
-                num_layers=len(hidden_sizes),
-                batch_first=True,
-                dropout=dropout if len(hidden_sizes) > 1 else 0.0,
+def get_custom_model_class():
+    torch, nn, ACTIVATIONS, _ = get_torch_utils()
+    
+    class DenseBlock(nn.Module):
+        def __init__(self, in_dim: int, out_dim: int, activation: str, dropout: float):
+            super().__init__()
+            act_cls = ACTIVATIONS.get(activation, nn.ReLU)
+            self.block = nn.Sequential(
+                nn.Linear(in_dim, out_dim),
+                nn.BatchNorm1d(out_dim),
+                act_cls(),
+                nn.Dropout(dropout),
             )
-            self.dropout = nn.Dropout(dropout)
-            self.output = nn.Linear(hidden_sizes[-1], output_dim)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.arch == "dense":
-            out = self.network(x)
-        else:
-            # x: (B, seq_len, features) — for tabular data we treat each row as seq_len=1
-            if x.dim() == 2:
-                x = x.unsqueeze(1)
-            if self.arch == "lstm":
-                out, (hidden, _) = self.rnn(x)
+        def forward(self, x):
+            return self.block(x)
+
+    class CustomModel(nn.Module):
+        def __init__(
+            self,
+            input_dim: int,
+            output_dim: int,
+            hidden_sizes: List[int],
+            arch: Literal["dense", "rnn", "lstm", "gru"],
+            activation: str = "relu",
+            dropout: float = 0.2,
+        ):
+            super().__init__()
+            self.arch = arch
+            self.hidden_sizes = hidden_sizes
+
+            if arch == "dense":
+                layers = []
+                prev = input_dim
+                for h in hidden_sizes:
+                    layers.append(DenseBlock(prev, h, activation, dropout))
+                    prev = h
+                self.network = nn.Sequential(*layers)
+                self.output = nn.Linear(prev, output_dim)
             else:
-                out, hidden = self.rnn(x)
-            out = self.dropout(hidden[-1])
-        return self.output(out)
+                rnn_cls = {"rnn": nn.RNN, "lstm": nn.LSTM, "gru": nn.GRU}[arch]
+                self.rnn = rnn_cls(
+                    input_size=input_dim,
+                    hidden_size=hidden_sizes[-1],
+                    num_layers=len(hidden_sizes),
+                    batch_first=True,
+                    dropout=dropout if len(hidden_sizes) > 1 else 0.0,
+                )
+                self.dropout = nn.Dropout(dropout)
+                self.output = nn.Linear(hidden_sizes[-1], output_dim)
+
+        def forward(self, x):
+            if self.arch == "dense":
+                out = self.network(x)
+            else:
+                if x.dim() == 2:
+                    x = x.unsqueeze(1)
+                if self.arch == "lstm":
+                    out, (hidden, _) = self.rnn(x)
+                else:
+                    out, hidden = self.rnn(x)
+                out = self.dropout(hidden[-1])
+            return self.output(out)
+            
+    return CustomModel
 
 
 # ─── Training Loop ───────────────────────────────────────────────────────────
@@ -138,6 +144,9 @@ def build_and_train(
         with _lock:
             _jobs[job_id]["status"] = "running"
 
+        torch, nn, _, OPTIMIZERS = get_torch_utils()
+        from torch.utils.data import DataLoader, TensorDataset
+
         Xtr = torch.tensor(X_train, dtype=torch.float32)
         ytr = torch.tensor(y_train, dtype=torch.float32)
         Xvl = torch.tensor(X_val, dtype=torch.float32)
@@ -147,6 +156,7 @@ def build_and_train(
         is_binary = task_type == "classification" and len(set(y_train)) <= 2
         output_dim = 1
 
+        CustomModel = get_custom_model_class()
         model = CustomModel(
             input_dim=input_dim,
             output_dim=output_dim,

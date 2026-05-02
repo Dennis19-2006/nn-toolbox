@@ -9,9 +9,6 @@ import threading
 import uuid
 from typing import Dict, List, Optional, Literal
 
-import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset
 import numpy as np
 
 from src.gradient_utils import register_gradient_hooks, compute_gradient_norms, diagnose_gradients
@@ -57,45 +54,48 @@ class SimpleTokenizer:
 
 # ─── Model ────────────────────────────────────────────────────────────────────
 
-class SentimentRNN(nn.Module):
-    def __init__(
-        self,
-        vocab_size: int,
-        embed_dim: int = 64,
-        hidden_dim: int = 128,
-        num_layers: int = 2,
-        num_classes: int = 1,
-        arch: Literal["rnn", "lstm", "gru"] = "lstm",
-        dropout: float = 0.3,
-    ):
-        super().__init__()
-        self.arch = arch
-        self.num_classes = num_classes
+def get_sentiment_rnn_class():
+    import torch.nn as nn
+    class SentimentRNN(nn.Module):
+        def __init__(
+            self,
+            vocab_size: int,
+            embed_dim: int = 64,
+            hidden_dim: int = 128,
+            num_layers: int = 2,
+            num_classes: int = 1,
+            arch: Literal["rnn", "lstm", "gru"] = "lstm",
+            dropout: float = 0.3,
+        ):
+            super().__init__()
+            self.arch = arch
+            self.num_classes = num_classes
 
-        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
-        rnn_cls = {"rnn": nn.RNN, "lstm": nn.LSTM, "gru": nn.GRU}[arch]
-        self.rnn = rnn_cls(
-            embed_dim,
-            hidden_dim,
-            num_layers=num_layers,
-            dropout=dropout if num_layers > 1 else 0.0,
-            batch_first=True,
-        )
-        self.dropout = nn.Dropout(dropout)
-        out_dim = 1 if num_classes <= 2 else num_classes
-        self.fc = nn.Linear(hidden_dim, out_dim)
+            self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+            rnn_cls = {"rnn": nn.RNN, "lstm": nn.LSTM, "gru": nn.GRU}[arch]
+            self.rnn = rnn_cls(
+                embed_dim,
+                hidden_dim,
+                num_layers=num_layers,
+                dropout=dropout if num_layers > 1 else 0.0,
+                batch_first=True,
+            )
+            self.dropout = nn.Dropout(dropout)
+            out_dim = 1 if num_classes <= 2 else num_classes
+            self.fc = nn.Linear(hidden_dim, out_dim)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        embedded = self.dropout(self.embedding(x))
-        if self.arch == "lstm":
-            out, (hidden, _) = self.rnn(embedded)
-        else:
-            out, hidden = self.rnn(embedded)
-        # Take last hidden-state from top layer
-        last_hidden = hidden[-1]  # (batch, hidden)
-        last_hidden = self.dropout(last_hidden)
-        logits = self.fc(last_hidden)
-        return logits
+        def forward(self, x):
+            import torch
+            embedded = self.dropout(self.embedding(x))
+            if self.arch == "lstm":
+                out, (hidden, _) = self.rnn(embedded)
+            else:
+                out, hidden = self.rnn(embedded)
+            last_hidden = hidden[-1]
+            last_hidden = self.dropout(last_hidden)
+            logits = self.fc(last_hidden)
+            return logits
+    return SentimentRNN
 
 
 # ─── Job Store ────────────────────────────────────────────────────────────────
@@ -137,13 +137,23 @@ def train_sentiment(
 ):
     """Runs in a background thread, writes metrics into _jobs[job_id]."""
     try:
+        import torch
+        from torch.utils.data import DataLoader, TensorDataset
+        import torch.nn as nn
+        
         with _jobs_lock:
             _jobs[job_id]["status"] = "running"
 
-        # Tokenize
         tokenizer = SimpleTokenizer(max_vocab=max_vocab, max_len=max_len)
         tokenizer.fit(texts)
-        X = tokenizer.encode(texts)  # (N, max_len)
+        
+        seqs = []
+        for t in texts:
+            ids = [tokenizer.word2idx.get(w, tokenizer.UNK) for w in tokenizer._tokenize(t)]
+            ids = ids[: tokenizer.max_len]
+            ids += [tokenizer.PAD] * (tokenizer.max_len - len(ids))
+            seqs.append(ids)
+        X = torch.tensor(seqs, dtype=torch.long)
         y = torch.tensor(labels, dtype=torch.float32)
 
         # Train/val split
@@ -155,6 +165,7 @@ def train_sentiment(
         X_val, y_val = X[val_idx], y[val_idx]
 
         num_classes = len(set(labels))
+        SentimentRNN = get_sentiment_rnn_class()
         model = SentimentRNN(
             vocab_size=len(tokenizer.word2idx),
             embed_dim=embed_dim,
